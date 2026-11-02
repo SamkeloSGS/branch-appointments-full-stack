@@ -1,0 +1,4 @@
+# Local settings (copied from .env.example)
+.env
+# Secrets rendered from the local Vault by vault/init.sh
+.secrets/

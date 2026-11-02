@@ -1,0 +1,235 @@
+# Branch Appointments, the whole app from its images: the frontend and backend images (built and pushed by their
+# projects' GitHub workflows) with everything they need. Local only: dev-mode Vault, local test users, demo data.
+#   cp .env.example .env      the published images (BACKEND_IMAGE, FRONTEND_IMAGE); other settings optional
+#   docker compose pull       fetch the latest images
+#   docker compose up -d
+# Then http://localhost:4200 (sign in as customer@, staff@ or manager@appointments.test, password Local-dev-password-1).
+# Other pages: Keycloak http://localhost:8180, Mailpit http://localhost:8025, Grafana http://localhost:3000,
+# Swagger UI http://localhost:8081/swagger-ui.html.
+# Uses the same host ports as the backend project's compose.yaml: stop that one (and npm start, mvn spring-boot:run)
+# first, or change the ports in .env. Keycloak, Vault and monitoring config are copies of the backend project's
+# keycloak/, vault/ and monitoring/; keep them in step when those change.
+#
+# Every setting below is ${NAME:-default}: set NAME in .env (see .env.example) to change it. The defaults run
+# everything on this machine. Addresses the browser uses are built from the host ports, so changing a port moves them
+# along (except Keycloak's address built into the frontend image: see .env.example).
+name: branch-appointments
+
+services:
+  frontend:
+    image: ${FRONTEND_IMAGE:?set FRONTEND_IMAGE in .env}
+    environment:
+      BACKEND_URL: ${BACKEND_URL:-http://backend:8081}   # where nginx sends /api
+    ports:
+      - "${FRONTEND_PORT:-4200}:8080"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  backend:
+    image: ${BACKEND_IMAGE:?set BACKEND_IMAGE in .env}
+    environment:
+      # Local settings and demo data (application-local.yml); the values below replace its localhost addresses
+      SPRING_PROFILES_ACTIVE: ${BACKEND_PROFILES:-local}
+      DEPLOYMENT_ENVIRONMENT: ${DEPLOYMENT_ENVIRONMENT:-local}
+      # Vault: the dev-mode server below, signed in with its root token
+      VAULT_URI: ${VAULT_URI:-http://vault:8200}
+      VAULT_AUTHENTICATION: ${VAULT_AUTHENTICATION:-TOKEN}
+      VAULT_TOKEN: ${VAULT_TOKEN:-local-dev-root-token}
+      # Database, cache and mail (logins come from Vault)
+      DATABASE_URL: ${DATABASE_URL:-jdbc:postgresql://postgres:5432/${DATABASE_NAME:-appointments}}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_SSL: ${REDIS_SSL:-false}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-false}
+      # Tokens name Keycloak as the browser sees it (the issuer); the backend calls it by its service name
+      JWT_ISSUER_URI: ${KEYCLOAK_PUBLIC_URL:-http://localhost:${KEYCLOAK_PORT:-8180}}/realms/appointments
+      KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080/realms/appointments}
+      KEYCLOAK_ADMIN_ENABLED: ${KEYCLOAK_ADMIN_ENABLED:-true}
+      FIRST_ADMIN_EMAIL: ${FIRST_ADMIN_EMAIL:-manager@appointments.test}
+      # Links in emails: the frontend's address, and the pages under it
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:${FRONTEND_PORT:-4200}}
+      MANAGE_URL: ${MANAGE_URL:-${FRONTEND_URL:-http://localhost:${FRONTEND_PORT:-4200}}/appointments/{reference}}
+      SIGN_UP_URL: ${SIGN_UP_URL:-${FRONTEND_URL:-http://localhost:${FRONTEND_PORT:-4200}}/sign-up}
+      STAFF_SETUP_REDIRECT_URL: ${STAFF_SETUP_REDIRECT_URL:-${FRONTEND_URL:-http://localhost:${FRONTEND_PORT:-4200}}/admin}
+      NOTIFICATION_EMAIL_FROM: ${NOTIFICATION_EMAIL_FROM:-appointments@appointments.test}
+      # The one branch this deployment runs for
+      BRANCH_CODE: ${BRANCH_CODE:-SANDTON}
+      BRANCH_NAME: ${BRANCH_NAME:-Sandton City}
+      BRANCH_STREET: ${BRANCH_STREET:-Sandton City, cnr Rivonia Road and 5th Street}
+      BRANCH_CITY: ${BRANCH_CITY:-Sandton}
+      BRANCH_PROVINCE: ${BRANCH_PROVINCE:-Gauteng}
+      BRANCH_POSTAL_CODE: ${BRANCH_POSTAL_CODE:-2196}
+      BRANCH_LATITUDE: ${BRANCH_LATITUDE:--26.1076}
+      BRANCH_LONGITUDE: ${BRANCH_LONGITUDE:-28.0567}
+      BRANCH_TIME_ZONE: ${BRANCH_TIME_ZONE:-Africa/Johannesburg}
+      BRANCH_SEGMENTS: ${BRANCH_SEGMENTS:-PERSONAL,BUSINESS}
+      # Monitoring, API docs and limits
+      OTLP_ENDPOINT: ${OTLP_ENDPOINT:-http://monitoring:4318}
+      TRACING_SAMPLING_PROBABILITY: ${TRACING_SAMPLING_PROBABILITY:-1.0}
+      API_DOCS_ENABLED: ${API_DOCS_ENABLED:-true}
+      RATE_LIMITS_ENABLED: ${RATE_LIMITS_ENABLED:-true}
+    ports:
+      - "${BACKEND_PORT:-8081}:8081"   # Swagger UI; the browser reaches the API through the frontend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17
+    environment:
+      # The same login is seeded into Vault (vault-init), where the backend and postgres-exporter read it
+      POSTGRES_DB: ${DATABASE_NAME:-appointments}
+      POSTGRES_USER: ${DATABASE_USERNAME:-appointments}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-appointments}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    # A cache only: nothing is written to disk, and entries that would not fit are dropped, least recently used first
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "${REDIS_MAX_MEMORY:-128mb}", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  vault:
+    image: hashicorp/vault:1.20.4
+    command: ["server", "-dev"]
+    environment:
+      # Dev mode: in memory, already unsealed, fixed root token. Local only, never for real secrets.
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-local-dev-root-token}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  # Seeds the secrets on every start (a dev-mode Vault keeps nothing) and renders the ones Keycloak and
+  # postgres-exporter need into .secrets/; the backend reads its own from Vault
+  vault-init:
+    image: hashicorp/vault:1.20.4
+    entrypoint: ["/bin/sh", "/vault-init/init.sh"]
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN:-local-dev-root-token}
+      # The values seeded (vault/init.sh)
+      DATABASE_USERNAME: ${DATABASE_USERNAME:-appointments}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-appointments}
+      KEYCLOAK_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      BACKEND_CLIENT_SECRET: ${BACKEND_CLIENT_SECRET:-local-dev-backend-secret}
+      WEBHOOK_SECRET_LOCAL: ${WEBHOOK_SECRET_LOCAL:-local-dev-webhook-secret}
+    volumes:
+      - ./vault/init.sh:/vault-init/init.sh:ro
+      - ./.secrets:/out
+    depends_on:
+      vault:
+        condition: service_healthy
+    restart: "no"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.0
+    # Secrets (admin login, SMTP login, backend client secret) come from Vault through the rendered env file
+    entrypoint: ["/bin/bash", "-c", ". /run/secrets/appointments/keycloak.env && exec /opt/keycloak/bin/kc.sh start-dev --import-realm"]
+    environment:
+      KC_HOSTNAME: ${KEYCLOAK_PUBLIC_URL:-http://localhost:${KEYCLOAK_PORT:-8180}}
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_EVENT_METRICS_USER_ENABLED: "true"
+      # Values for the placeholders in keycloak/appointments-realm.json
+      KC_REALM_SSL_REQUIRED: ${KEYCLOAK_SSL_REQUIRED:-external}
+      KC_SMTP_HOST: ${SMTP_HOST:-mailpit}
+      KC_SMTP_PORT: ${SMTP_PORT:-1025}
+      KC_SMTP_FROM: ${KEYCLOAK_EMAIL_FROM:-no-reply@appointments.test}
+      KC_SMTP_AUTH: ${KEYCLOAK_SMTP_AUTH:-false}
+      KC_SMTP_STARTTLS: ${SMTP_STARTTLS:-false}
+      KC_WEB_REDIRECT_URI: ${FRONTEND_URL:-http://localhost:${FRONTEND_PORT:-4200}}/*
+      KC_WEB_ORIGIN: ${FRONTEND_URL:-http://localhost:${FRONTEND_PORT:-4200}}
+      KC_SWAGGER_REDIRECT_URI: http://localhost:${BACKEND_PORT:-8081}/swagger-ui/oauth2-redirect.html
+      KC_SWAGGER_ORIGIN: http://localhost:${BACKEND_PORT:-8081}
+    ports:
+      - "${KEYCLOAK_PORT:-8180}:8080"
+    volumes:
+      - ./keycloak/appointments-realm.json:/opt/keycloak/data/import/appointments-realm.json:ro
+      - ./keycloak/local/appointments-users-0.json:/opt/keycloak/data/import/appointments-users-0.json:ro
+      - keycloak-data:/opt/keycloak/data
+      - ./.secrets/keycloak:/run/secrets/appointments:ro
+    depends_on:
+      mailpit:
+        condition: service_started
+      vault-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  mailpit:
+    image: axllent/mailpit:v1.29
+    ports:
+      - "${MAILPIT_PORT:-8025}:8025"   # web UI: Keycloak's and the backend's emails
+    restart: unless-stopped
+
+  monitoring:
+    image: grafana/otel-lgtm:0.37.0
+    environment:
+      # Adds the Keycloak and PostgreSQL scrape jobs to the image's collector configuration
+      OTELCOL_EXTRA_ARGS: --config=file:/otel-lgtm/appointments/otelcol-appointments.yaml
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: ${SMTP_HOST:-mailpit}:${SMTP_PORT:-1025}
+      GF_SMTP_FROM_ADDRESS: ${GRAFANA_EMAIL_FROM:-grafana@appointments.test}
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"   # Grafana
+    volumes:
+      - ./monitoring/otelcol-appointments.yaml:/otel-lgtm/appointments/otelcol-appointments.yaml:ro
+      - ./monitoring/dashboards:/otel-lgtm/appointments/dashboards:ro
+      - ./monitoring/provisioning/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/appointments.yaml:ro
+      - ./monitoring/provisioning/alerting.yaml:/otel-lgtm/grafana/conf/provisioning/alerting/appointments.yaml:ro
+      - monitoring-data:/data
+    depends_on:
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.20.1
+    environment:
+      DATA_SOURCE_URI: postgres:5432/${DATABASE_NAME:-appointments}?sslmode=disable
+      DATA_SOURCE_USER_FILE: /run/secrets/appointments/postgres-username
+      DATA_SOURCE_PASS_FILE: /run/secrets/appointments/postgres-password
+    volumes:
+      - ./.secrets/monitoring:/run/secrets/appointments:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  keycloak-data:
+  monitoring-data:
